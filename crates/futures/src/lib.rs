@@ -72,11 +72,12 @@ mod task {
 ///
 /// This function has the same panic behavior as `future_to_promise`.
 #[inline]
-pub fn spawn_local<F>(future: F)
+pub fn spawn_local<F, T>(future: F) -> T
 where
-    F: Future<Output = ()> + 'static,
+    F: Future<Output = T> + 'static,
+    T: 'static
 {
-    task::Task::spawn(Box::pin(future));
+    task::Task::spawn(Box::pin(future))
 }
 
 struct Inner {

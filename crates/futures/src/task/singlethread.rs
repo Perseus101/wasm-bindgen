@@ -5,34 +5,72 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
-struct Inner {
-    future: Pin<Box<dyn Future<Output = ()> + 'static>>,
+pub(crate) trait TaskTrait {
+    fn run(&self);
+}
+
+impl<T> TaskTrait for Task<T>
+where
+    T: 'static
+{
+    fn run(&self) {
+        Task::run(self)
+    }
+}
+
+struct Inner<T> {
+    future: Pin<Box<dyn Future<Output = T> + 'static>>,
     waker: Waker,
 }
 
-pub(crate) struct Task {
+enum InnerWrap<T> {
+    None,
+    Running(Inner<T>),
+    Finished(T)
+}
+
+impl<T> InnerWrap<T> {
+    pub fn try_unwrap_running(&mut self) -> Option<&mut Inner<T>> {
+        match self {
+            Self::Running(ref mut x) => Some(x),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) struct Task<T> {
     // The actual Future that we're executing as part of this task.
     //
     // This is an Option so that the Future can be immediately dropped when it's
     // finished
-    inner: RefCell<Option<Inner>>,
+    inner: RefCell<InnerWrap<T>>,
 
     // This is used to ensure that the Task will only be queued once
     is_queued: Cell<bool>,
 }
 
-impl Task {
-    pub(crate) fn spawn(future: Pin<Box<dyn Future<Output = ()> + 'static>>) {
+impl<T> Task<T>
+where
+    T: 'static
+{
+    pub(crate) fn spawn(future: Pin<Box<dyn Future<Output = T> + 'static>>) -> T {
         let this = Rc::new(Self {
-            inner: RefCell::new(None),
+            inner: RefCell::new(InnerWrap::None),
             is_queued: Cell::new(false),
         });
 
         let waker = unsafe { Waker::from_raw(Task::into_raw_waker(Rc::clone(&this))) };
 
-        *this.inner.borrow_mut() = Some(Inner { future, waker });
+        *this.inner.borrow_mut() = InnerWrap::Running(Inner { future, waker });
 
         Task::wake_by_ref(&this);
+
+        let inner = RefCell::new(InnerWrap::None);
+        this.inner.swap(&inner);
+        match inner.into_inner() {
+            InnerWrap::None | InnerWrap::Running(_) => panic!("Future failed to set return value"),
+            InnerWrap::Finished(v) => v 
+        }
     }
 
     fn wake_by_ref(this: &Rc<Self>) {
@@ -44,7 +82,11 @@ impl Task {
         }
 
         crate::queue::QUEUE.with(|queue| {
-            queue.push_task(Rc::clone(this));
+            let this = Rc::clone(this);
+            let dyn_this: Rc<dyn TaskTrait> = unsafe { 
+                Rc::from_raw(Rc::into_raw(this) as *const dyn TaskTrait)
+            };
+            queue.push_task(dyn_this);
         });
     }
 
@@ -57,22 +99,22 @@ impl Task {
     /// `Rc` pointer is good enough.
     unsafe fn into_raw_waker(this: Rc<Self>) -> RawWaker {
         unsafe fn raw_clone(ptr: *const ()) -> RawWaker {
-            let ptr = ManuallyDrop::new(Rc::from_raw(ptr as *const Task));
+            let ptr = ManuallyDrop::new(Rc::from_raw(ptr as *const Task<()>));
             Task::into_raw_waker((*ptr).clone())
         }
 
         unsafe fn raw_wake(ptr: *const ()) {
-            let ptr = Rc::from_raw(ptr as *const Task);
+            let ptr = Rc::from_raw(ptr as *const Task<()>);
             Task::wake_by_ref(&ptr);
         }
 
         unsafe fn raw_wake_by_ref(ptr: *const ()) {
-            let ptr = ManuallyDrop::new(Rc::from_raw(ptr as *const Task));
+            let ptr = ManuallyDrop::new(Rc::from_raw(ptr as *const Task<()>));
             Task::wake_by_ref(&ptr);
         }
 
         unsafe fn raw_drop(ptr: *const ()) {
-            drop(Rc::from_raw(ptr as *const Task));
+            drop(Rc::from_raw(ptr as *const Task<()>));
         }
 
         const VTABLE: RawWakerVTable =
@@ -86,7 +128,7 @@ impl Task {
 
         // Wakeups can come in after a Future has finished and been destroyed,
         // so handle this gracefully by just ignoring the request to run.
-        let inner = match borrow.as_mut() {
+        let inner = match borrow.try_unwrap_running() {
             Some(inner) => inner,
             None => return,
         };
@@ -106,8 +148,8 @@ impl Task {
         // actually go away until all wakers referencing us go away, which may
         // take quite some time, so ensure that the heaviest of resources are
         // released early.
-        if let Poll::Ready(_) = poll {
-            *borrow = None;
+        if let Poll::Ready(v) = poll {
+            *borrow = InnerWrap::Finished(v);
         }
     }
 }
